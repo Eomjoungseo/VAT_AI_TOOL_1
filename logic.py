@@ -46,6 +46,34 @@ def parse_발급자(발급자):
     if m: return m.group(1).strip(), m.group(2).strip()
     return str(발급자).strip(), ''
 
+def parse_거래기간(거래기간):
+    """'2026.01.01 ~ 2026.03.31' → ('202601', '202603'). 실패 시 ('','')."""
+    nums = re.findall(r'(\d{4})[.\-/](\d{1,2})', str(거래기간))
+    if len(nums) >= 2:
+        (y1, m1), (y2, m2) = nums[0], nums[-1]
+        return f"{y1}{int(m1):02d}", f"{y2}{int(m2):02d}"
+    if len(nums) == 1:
+        y, m = nums[0]
+        return f"{y}{int(m):02d}", f"{y}{int(m):02d}"
+    return '', ''
+
+def to_yyyymmdd(일자):
+    """'2026/01/31' 또는 '2026-01-31' → 정수 20260131. 실패 시 원본 반환."""
+    s = re.sub(r'[^\d]', '', str(일자))
+    if len(s) == 8:
+        return int(s)
+    return 일자
+
+def strip_브랜드(발급자):
+    """발급자명 끝의 브랜드 괄호만 제거. '쇼피_대만(퓌)' → '쇼피_대만'.
+    원래 이름에 포함된 괄호(예: '아소레(Asoure)')는 보존."""
+    s = str(발급자)
+    브랜드값 = set(브랜드코드.values())
+    m = re.match(r'^(.+?)\(([^()]+)\)\s*$', s)
+    if m and m.group(2).strip() in 브랜드값:
+        return m.group(1).strip()
+    return s.strip()
+
 def make_발급자(거래처, 브랜드, issuer_corrections):
     if 거래처 in 환급_거래처: return 거래처
     if 거래처 == '간주공급(사업상증여)': return '간주공급(사업상 증여)'
@@ -914,3 +942,190 @@ def fill_외화(xlsx_path, csv_path, log_cb=None):
 
     wb.save(xlsx_path)
     return 성공, 실패, csv_합계, 엑셀_합계
+
+
+# ─── [통합용] 외화금액을 rows 딕셔너리에 직접 채우기 ──────────────────────────
+def apply_외화_to_rows(rows, csv_path, log_cb=None):
+    """
+    세금계산서현황 엑셀(.xlsx)을 읽어 rows 리스트의 각 행 딕셔너리에
+    환율·외화_당기제출·외화_당기신고 값을 직접 채운다.
+    (기존 fill_외화의 룩업 로직 재사용, 단 엑셀 셀이 아니라 메모리 rows 수정)
+
+    반환: (성공건수, 실패목록, csv_합계dict, 엑셀_합계dict)
+    """
+    def lbk(msg):
+        if log_cb: log_cb(msg)
+
+    def gb(s):
+        m = re.search(r'\(([NFPRK])\)', str(s))
+        return 브랜드코드.get(m.group(1), '') if m else ''
+
+    df = pd.read_excel(csv_path)
+    df = df[df['(세금)계산서일'].astype(str).str.match(r'\d{4}-\d{2}-\d{2}')].copy()
+    for col in ['공급가액','환율','외화']:
+        df[col] = pd.to_numeric(df[col].astype(str).str.replace(',',''), errors='coerce').fillna(0)
+    df['month']  = df['(세금)계산서일'].astype(str).str[5:7]
+    df['브랜드'] = df['적요'].apply(gb)
+    df = df[df['환종'].notna() & ~df['환종'].isin(['KRW','nan'])].copy()
+
+    csv_합계 = df.groupby('환종')['외화'].sum().round(2).to_dict()
+
+    g = df.groupby(['거래처','브랜드','month','환종'], dropna=False).agg(
+        외화합계=('외화','sum'), 환율첫값=('환율','first')).reset_index()
+    lookup = {(r['거래처'],r['브랜드'],r['month']): {'외화': round(r['외화합계'],2), '환율': r['환율첫값']}
+              for _, r in g.iterrows()}
+
+    g2 = df.groupby(['거래처','month','환종'], dropna=False).agg(
+        외화합계=('외화','sum'), 환율첫값=('환율','first')).reset_index()
+    lookup_nb = {(r['거래처'],'',r['month']): {'외화': round(r['외화합계'],2), '환율': r['환율첫값']}
+                 for _, r in g2.iterrows()}
+
+    lookup_원화 = {}
+    for 거래처 in 원화기준_거래처:
+        for _, r in df[df['거래처']==거래처].iterrows():
+            lookup_원화[int(r['공급가액'])] = {'외화': round(r['외화'],2), '환율': r['환율']}
+
+    성공 = 0; 실패 = []; 엑셀_합계 = {}
+
+    for r in rows:
+        통화  = r.get('통화코드','') or ''
+        서류명 = r.get('서류명','') or ''
+        if 통화 == 'KRW' or '간주공급' in 서류명:
+            continue
+
+        발급자 = r.get('발급자','') or ''
+        발급일자 = str(r.get('발급일자','') or '')
+        month = 발급일자[5:7] if len(발급일자) >= 7 else ''
+        거래처, 브랜드 = parse_발급자(발급자)
+        원화 = r.get('원화_당기제출')
+
+        if 거래처 in 원화기준_거래처:
+            info = lookup_원화.get(int(원화)) if 원화 else None
+        elif 거래처 in 월별합산_거래처:
+            info = lookup_nb.get((거래처,'',month))
+        else:
+            info = lookup.get((거래처,브랜드,month))
+
+        if info:
+            환율 = info['환율'] if info['환율'] != 0 else ''
+            외화 = info['외화']
+            r['환율']        = 환율
+            r['외화_당기제출'] = 외화
+            r['외화_당기신고'] = 외화
+            엑셀_합계[통화] = round(엑셀_합계.get(통화,0) + 외화, 2)
+            성공 += 1
+            lbk(f"  ✅ [{발급자}] {통화} {외화:,.2f}")
+        else:
+            r['_외화실패'] = True
+            실패.append(f"[{발급자}] {month}월 ({통화})")
+            lbk(f"  ❌ [{발급자}] {month}월 — 매핑 실패")
+
+    return 성공, 실패, csv_합계, 엑셀_합계
+
+
+# ─── [신규 양식] VATVTZ02100 명세서 엑셀 생성 ────────────────────────────────
+def create_excel_omni(rows, config, output_path):
+    """
+    국세청 업로드용 VATVTZ02100 양식으로 영세율첨부서류제출명세서 생성.
+    - 시트 1개 (VATVTZ02100), 명세서 데이터만
+    - 상단 회사정보 블록 + 16컬럼 데이터 헤더
+    - 발급/선적일자는 YYYYMMDD 정수, 색상·병합·합계행 없음
+    """
+    SHEET_NM = 'VATVTZ02100'
+    회사코드 = str(config.get('회사코드', '1000'))
+    회사명   = config.get('상호', '비나우').replace('(주)', '').replace('㈜', '').strip()
+    사업자번호 = re.sub(r'[^\d]', '', str(config.get('사업자등록번호', '8338701017')))
+    사업장코드 = str(config.get('사업장코드', '1000'))
+    신고구분   = int(config.get('신고구분', 2))
+    수정순번   = int(config.get('수정순번', 0))
+    from_ym, to_ym = parse_거래기간(config.get('거래기간', ''))
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = SHEET_NM
+
+    thin = Side(style='thin', color='BFBFBF')
+    tb   = Border(left=thin, right=thin, top=thin, bottom=thin)
+    cc   = Alignment(horizontal='center', vertical='center')
+    lc   = Alignment(horizontal='left',   vertical='center')
+    rc   = Alignment(horizontal='right',  vertical='center')
+    HDR_FILL = PatternFill('solid', start_color='D9E1F2')
+    KEY_FILL = PatternFill('solid', start_color='F2F2F2')
+    hdr_f = Font(name='Arial', bold=True, size=9)
+    key_f = Font(name='Arial', bold=True, size=9, color='595959')
+    d_f   = Font(name='Arial', size=9)
+
+    # ── 상단 회사정보 블록 (행1~3) ──
+    회사_keys   = ['COMPANY_CD', 'COMPANY_NM', 'BIZR_NO']
+    회사_labels = ['회사코드', '회사명', '사업자번호']
+    회사_vals   = [회사코드, 회사명, 사업자번호]
+    for ci, v in enumerate(회사_keys, 1):
+        c = ws.cell(1, ci, value=v); c.font = key_f; c.fill = KEY_FILL; c.border = tb; c.alignment = cc
+    for ci, v in enumerate(회사_labels, 1):
+        c = ws.cell(2, ci, value=v); c.font = key_f; c.fill = KEY_FILL; c.border = tb; c.alignment = cc
+    for ci, v in enumerate(회사_vals, 1):
+        c = ws.cell(3, ci, value=v); c.font = d_f; c.border = tb; c.alignment = cc
+    # 행4 비움 (양식과 동일)
+
+    # ── 데이터 헤더 (행5: 영문키 / 행6: 한글라벨) ──
+    eng_keys = ['BIZAREA_CD','DECL_FG','FROM_YM','TO_YM','MRTF_SQ','DTLSTA_NM','ISSUER_NM',
+                'ISSUE_DT','SHIPNG_DT','EXCH_CD','EXRT_RT','SBMT_AMT2','KRW_SBMT_AMT',
+                'DECL_AMT2','KRW_DECL_AMT','RMK_DC']
+    kor_labels = ['사업장코드','신고구분','과세기간시작년월','과세기간종료년월','수정경정청구순번',
+                  '서류명','발급자명','발급일자','선적일자','수출통화코드','환율',
+                  '당기제출금액(외화)','당기제출금액(원화)','당기신고해당분(외화)','당기신고해당분(원화)','비고내역']
+    for ci, v in enumerate(eng_keys, 1):
+        c = ws.cell(5, ci, value=v); c.font = hdr_f; c.fill = HDR_FILL; c.border = tb; c.alignment = cc
+    for ci, v in enumerate(kor_labels, 1):
+        c = ws.cell(6, ci, value=v); c.font = hdr_f; c.fill = HDR_FILL; c.border = tb; c.alignment = cc
+
+    # ── 데이터 행 (행7~) ──
+    DS = 7
+    for i, r in enumerate(rows):
+        rn = DS + i
+        통화 = r.get('통화코드', '') or ''
+        환율 = r.get('환율', '')
+        외화제출 = r.get('외화_당기제출', '')
+        외화신고 = r.get('외화_당기신고', '')
+        원화제출 = r.get('원화_당기제출', '')
+        원화신고 = r.get('원화_당기신고', '')
+        # KRW는 환율 1, 외화=원화 그대로 (양식 관례)
+        if 통화 == 'KRW':
+            환율 = 1
+            외화제출 = 원화제출
+            외화신고 = 원화신고
+
+        vals = [
+            (1,  사업장코드,                        cc, None),
+            (2,  신고구분,                          cc, None),
+            (3,  int(from_ym) if from_ym else '',   cc, None),
+            (4,  int(to_ym) if to_ym else '',       cc, None),
+            (5,  수정순번,                          cc, None),
+            (6,  r.get('서류명',''),                lc, None),
+            (7,  strip_브랜드(r.get('발급자','')),  lc, None),
+            (8,  to_yyyymmdd(r.get('발급일자','')), cc, None),
+            (9,  to_yyyymmdd(r.get('선적일자','')), cc, None),
+            (10, 통화,                              cc, None),
+            (11, 환율,                              rc, '#,##0.######'),
+            (12, 외화제출,                          rc, '#,##0.00'),
+            (13, 원화제출,                          rc, '#,##0'),
+            (14, 외화신고,                          rc, '#,##0.00'),
+            (15, 원화신고,                          rc, '#,##0'),
+            (16, r.get('비고','') or '-',           lc, None),
+        ]
+        for ci, val, al, nfmt in vals:
+            c = ws.cell(rn, ci, value=val if val != '' else None)
+            c.font = d_f; c.border = tb; c.alignment = al
+            if nfmt and isinstance(val, (int, float)):
+                c.number_format = nfmt
+        ws.row_dimensions[rn].height = 14
+
+    # 컬럼 너비
+    widths = {'A':10,'B':8,'C':14,'D':14,'E':12,'F':30,'G':24,'H':12,'I':12,
+              'J':10,'K':12,'L':18,'M':18,'N':18,'O':18,'P':22}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = 'A7'
+
+    wb.save(output_path)
+    return True
