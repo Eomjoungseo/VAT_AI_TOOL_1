@@ -112,6 +112,15 @@ def make_발급자(거래처, 브랜드, issuer_corrections):
 def load_매입매출장(filepath):
     df = read_table(filepath, header=0)
     df = df[df['(세금)계산서일'].astype(str).str.match(r'\d{4}-\d{2}-\d{2}')].copy()
+    # csv 등에서 천단위 콤마가 포함된 문자열 금액을 숫자로 정규화
+    for col in ['공급가액', '세액', '합계']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(',', '', regex=False).str.strip(),
+                errors='coerce'
+            )
+    df = df[df['공급가액'].notna()].copy()
+    df['공급가액'] = df['공급가액'].astype(int)
     df['브랜드'] = df['적요'].apply(get_brand)
     df['month']  = df['(세금)계산서일'].astype(str).str[5:7]
     기타 = df[df['세무'] == '기타영세'].copy()
