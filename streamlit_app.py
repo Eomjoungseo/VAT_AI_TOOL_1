@@ -556,11 +556,11 @@ with tab_run:
         st.markdown("#### 📁 입력 파일")
         매입매출장_file = st.file_uploader(
             "① 매입매출장 — 영세매출·기타영세 (필수)",
-            type=["xlsx"], key="run_매입매출장"
+            type=["xlsx", "xls", "csv"], key="run_매입매출장"
         )
         세금계산서_file = st.file_uploader(
             "② 세금계산서현황 — 외화금액용 (외화 거래 있으면 필수)",
-            type=["xlsx"], key="run_세금계산서"
+            type=["xlsx", "xls", "csv"], key="run_세금계산서"
         )
         즉시환급_files = st.file_uploader(
             "③ 즉시환급 실적명세서 PDF — 파일명에 사업장명 포함 (예: 퓌 아지트 성수)",

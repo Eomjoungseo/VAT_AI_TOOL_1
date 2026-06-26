@@ -13,6 +13,30 @@ from openpyxl.utils import get_column_letter
 # ─── 상수 ─────────────────────────────────────────────────────────────────
 브랜드코드 = {"N": "넘버즈인", "F": "퓌", "P": "플라스킨", "R": "라이아", "K": "노크"}
 
+
+# ─── 파일 읽기 (xlsx / csv 자동 분기) ──────────────────────────────────────
+def read_table(filepath, **kwargs):
+    """
+    확장자에 따라 엑셀(.xlsx/.xls) 또는 CSV를 읽어 DataFrame 반환.
+    CSV는 한글 인코딩(utf-8-sig, cp949, euc-kr 등)을 순차 시도한다.
+    pd.read_excel과 동일한 인자(header 등)를 그대로 전달 가능.
+    """
+    ext = Path(str(filepath)).suffix.lower()
+    if ext == '.csv':
+        last_err = None
+        for enc in ('utf-8-sig', 'cp949', 'euc-kr', 'utf-8', 'latin1'):
+            try:
+                return pd.read_csv(filepath, encoding=enc, **kwargs)
+            except (UnicodeDecodeError, UnicodeError) as e:
+                last_err = e
+                continue
+            except Exception:
+                # 인코딩 외 오류(파싱 등)는 다음 인코딩 시도해도 동일하므로 중단
+                raise
+        raise ValueError(f"CSV 인코딩을 인식하지 못했습니다: {last_err}")
+    # 기본: 엑셀
+    return pd.read_excel(filepath, **kwargs)
+
 틱톡_거래처     = {"틱톡샵_태국"}
 간주공급_거래처  = {"간주공급(사업상증여)"}
 환급_거래처     = {"퓌 아지트 성수", "퓌 아지트 연남", "퓌 아지트 부산", "노크 아카이브 성수"}
@@ -86,7 +110,7 @@ def make_발급자(거래처, 브랜드, issuer_corrections):
 
 # ─── 매입매출장 로드 ──────────────────────────────────────────────────────
 def load_매입매출장(filepath):
-    df = pd.read_excel(filepath, header=0)
+    df = read_table(filepath, header=0)
     df = df[df['(세금)계산서일'].astype(str).str.match(r'\d{4}-\d{2}-\d{2}')].copy()
     df['브랜드'] = df['적요'].apply(get_brand)
     df['month']  = df['(세금)계산서일'].astype(str).str[5:7]
@@ -866,7 +890,7 @@ def fill_외화(xlsx_path, csv_path, log_cb=None):
         return 브랜드코드.get(m.group(1), '') if m else ''
 
     # 엑셀 로드 (xlsx)
-    df = pd.read_excel(csv_path)
+    df = read_table(csv_path)
     df = df[df['(세금)계산서일'].astype(str).str.match(r'\d{4}-\d{2}-\d{2}')].copy()
     for col in ['공급가액','환율','외화']:
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(',',''), errors='coerce').fillna(0)
@@ -960,7 +984,7 @@ def apply_외화_to_rows(rows, csv_path, log_cb=None):
         m = re.search(r'\(([NFPRK])\)', str(s))
         return 브랜드코드.get(m.group(1), '') if m else ''
 
-    df = pd.read_excel(csv_path)
+    df = read_table(csv_path)
     df = df[df['(세금)계산서일'].astype(str).str.match(r'\d{4}-\d{2}-\d{2}')].copy()
     for col in ['공급가액','환율','외화']:
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(',',''), errors='coerce').fillna(0)
