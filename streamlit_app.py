@@ -16,7 +16,7 @@ from logic import (
     parse_환급PDF, parse_수기전표PDF, parse_면세물품명세서PDF,
     fill_외화, apply_외화_to_rows,
     update_검증요약_step1, update_검증요약_step2, update_검증요약_외화,
-    parse_거래기간,
+    parse_거래기간, parse_기수명,
 )
 
 # ── 페이지 기본 설정 ────────────────────────────────────────────────────────
@@ -172,6 +172,8 @@ if 'shared_수기전표_files' not in st.session_state:
     st.session_state.shared_수기전표_files = []
 if 'shared_매입매출장' not in st.session_state:
     st.session_state.shared_매입매출장 = None
+if 'run_error' not in st.session_state:
+    st.session_state.run_error = None
 
 # config의 면세판매장_코드를 logic 모듈에 반영 (매 실행마다)
 import logic as _logic_module
@@ -307,14 +309,36 @@ packages.txt       ← 시스템 패키지 목록
 # ════════════════════════════════════════════════════════════════════════════
 with tab_settings:
     st.title("🏠 기본 설정")
-    st.caption("매 기수마다 이 화면에서 먼저 설정하세요.")
+    st.caption("매 기수마다 이 화면에서 먼저 설정하세요. 기수명을 입력하면 거래기간·년도가 자동으로 채워집니다.")
+
+    # ── 기수명 입력 (form 밖) → 거래기간·년도 자동계산 ──
+    기수명 = st.text_input(
+        "기수명",
+        value=cfg.get("기수명", ""),
+        key="settings_기수명",
+        help="예: '25년 2기 예정', '26년 1기 확정' — 입력하면 아래 거래기간·년도가 자동 설정됩니다.",
+    )
+    파싱_년도, 파싱_거래기간 = parse_기수명(기수명)
+
+    # 자동계산 성공 시 그 값을, 실패 시 기존 저장값을 사용
+    auto_거래기간 = 파싱_거래기간 if 파싱_거래기간 else cfg.get("거래기간", "")
+    auto_년도     = 파싱_년도 if 파싱_년도 else int(cfg.get("년도", 2025))
+
+    if 기수명:
+        if 파싱_거래기간:
+            st.success(f"✅ 자동 설정 → 거래기간 **{auto_거래기간}** · 년도 **{auto_년도}**")
+        elif 파싱_년도:
+            st.warning("⚠️ 연도는 인식했지만 분기(1기/2기·예정/확정)를 못 읽었습니다. 거래기간을 직접 확인하세요.")
+        else:
+            st.warning("⚠️ 기수명 형식을 인식하지 못했습니다. 예: '25년 2기 예정'. 거래기간·년도를 직접 입력하세요.")
 
     with st.form("settings_form"):
         col1, col2 = st.columns(2)
         with col1:
-            기수명        = st.text_input("기수명",         value=cfg.get("기수명",""))
-            거래기간      = st.text_input("거래기간",       value=cfg.get("거래기간",""))
-            년도          = st.number_input("년도 (4자리)", value=int(cfg.get("년도",2025)),
+            거래기간      = st.text_input("거래기간 (자동 설정 / 필요시 수정)",
+                                          value=auto_거래기간)
+            년도          = st.number_input("년도 (자동 설정 / 필요시 수정)",
+                                            value=int(auto_년도),
                                             min_value=2000, max_value=2099, step=1)
             사업자등록번호 = st.text_input("사업자등록번호", value=cfg.get("사업자등록번호",""))
             상호          = st.text_input("상호(법인명)",   value=cfg.get("상호",""))
@@ -542,6 +566,62 @@ with tab_mapping:
 # ════════════════════════════════════════════════════════════════════════════
 # 🚀 명세서 생성 (1·2·3단계 통합)
 # ════════════════════════════════════════════════════════════════════════════
+
+def 해석_오류(e: Exception) -> str:
+    """예외를 사용자가 이해할 수 있는 한글 설명으로 변환. 모르면 일반 안내."""
+    name = type(e).__name__
+    msg  = str(e)
+
+    # 컬럼 누락 (KeyError: '컬럼명')
+    if name == 'KeyError':
+        col = msg.strip().strip("'\"")
+        return (f"업로드한 파일에 필요한 컬럼 **'{col}'** 이(가) 없습니다.\n\n"
+                f"매입매출장/세금계산서현황의 컬럼명이 바뀌었거나, 다른 형식의 파일을 "
+                f"올렸을 수 있습니다. 원본 RAW 파일인지, 컬럼명이 정확한지 확인해 주세요.")
+
+    # 숫자 변환 실패 (콤마·문자 섞인 금액 등)
+    if name == 'ValueError' and 'invalid literal for int' in msg:
+        return ("금액 컬럼에 숫자로 바꿀 수 없는 값이 들어 있습니다.\n\n"
+                "공급가액 등에 숫자·콤마 외의 문자가 섞여 있는지 확인해 주세요.")
+
+    # 인코딩 문제
+    if name in ('UnicodeDecodeError', 'UnicodeError') or 'codec' in msg or '인코딩' in msg:
+        return ("CSV 파일의 인코딩을 인식하지 못했습니다.\n\n"
+                "엑셀에서 다시 저장하거나, 'CSV UTF-8' 형식으로 내보낸 뒤 다시 올려 주세요.")
+
+    # 파일 형식 문제
+    if name in ('BadZipFile', 'InvalidFileException') or 'not a zip' in msg.lower() \
+       or 'Excel file format' in msg:
+        return ("엑셀 파일을 열 수 없습니다.\n\n"
+                "파일이 손상되었거나, 실제로는 .xlsx가 아닐 수 있습니다. "
+                "원본을 다시 받아 올려 주세요.")
+
+    # 빈 데이터
+    if name == 'EmptyDataError' or 'No columns to parse' in msg or 'empty' in msg.lower():
+        return ("파일에 읽을 데이터가 없습니다.\n\n빈 파일이 아닌지 확인해 주세요.")
+
+    # 매입매출장에 대상 데이터 없음 (직접 raise 한 메시지 등)
+    if '기타영세' in msg or '영세매출' in msg:
+        return ("매입매출장에서 '기타영세' 또는 '영세매출' 데이터를 찾지 못했습니다.\n\n"
+                "세무 구분 컬럼이 올바른지, 해당 거래가 있는 기간인지 확인해 주세요.")
+
+    # 그 외
+    return ("처리 중 예기치 못한 오류가 발생했습니다.\n\n"
+            "아래 원문과 상세 내용을 확인하시고, 반복되면 파일과 함께 문의해 주세요.")
+
+
+@st.dialog("⚠️ 명세서 생성 오류")
+def show_error_dialog(쉬운설명: str, 원문: str, 상세: str):
+    st.markdown(f"### 무엇이 잘못됐나요?\n\n{쉬운설명}")
+    st.markdown("---")
+    st.markdown("**오류 원문**")
+    st.code(원문, language=None)
+    with st.expander("🔧 개발자용 상세 내용 (Traceback)"):
+        st.code(상세, language=None)
+    if st.button("닫기", type="primary"):
+        st.rerun()
+
+
 with tab_run:
     st.title("🚀 영세율첨부서류제출명세서 생성")
     st.caption(
@@ -599,6 +679,7 @@ with tab_run:
     log_area = st.empty()
 
     if run_btn and 매입매출장_file:
+        st.session_state.run_error = None   # 새 실행 시작 — 이전 오류 초기화
         logs = []
         def log(msg):
             logs.append(msg)
@@ -759,8 +840,19 @@ with tab_run:
 
         except Exception as e:
             import traceback
-            log(f"\n❌ 오류: {e}")
-            log(traceback.format_exc())
+            상세 = traceback.format_exc()
+            원문 = f"{type(e).__name__}: {e}"
+            쉬운설명 = 해석_오류(e)
+            log(f"\n❌ 오류: {원문}")
+            log(상세)
+            # 배너용으로 세션에 저장 (모달을 닫아도 화면에 남도록)
+            st.session_state.run_error = {
+                '쉬운설명': 쉬운설명, '원문': 원문, '상세': 상세,
+            }
+            # 빨간 배너 (즉시 표시)
+            st.error(f"**명세서 생성 실패**\n\n{쉬운설명}\n\n---\n오류 원문: `{원문}`")
+            # 모달 팝업
+            show_error_dialog(쉬운설명, 원문, 상세)
         finally:
             for p in tmp_paths:
                 try: os.unlink(p)
@@ -775,11 +867,20 @@ with tab_run:
                 type="primary",
             )
 
-    elif st.session_state.shared_xlsx:
-        st.info(f"✅ 직전에 생성된 파일이 있습니다: {st.session_state.shared_xlsx_name}")
-        st.download_button(
-            label="⬇️ 명세서 다운로드",
-            data=st.session_state.shared_xlsx,
-            file_name=st.session_state.shared_xlsx_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    else:
+        # 버튼을 누르지 않은 렌더(모달 닫은 직후 rerun 포함):
+        # 직전 실행에서 오류가 있었으면 배너를 다시 표시
+        err = st.session_state.get('run_error')
+        if err:
+            st.error(f"**명세서 생성 실패**\n\n{err['쉬운설명']}\n\n---\n오류 원문: `{err['원문']}`")
+            with st.expander("🔧 개발자용 상세 내용 (Traceback)"):
+                st.code(err['상세'], language=None)
+
+        if st.session_state.shared_xlsx:
+            st.info(f"✅ 직전에 생성된 파일이 있습니다: {st.session_state.shared_xlsx_name}")
+            st.download_button(
+                label="⬇️ 명세서 다운로드",
+                data=st.session_state.shared_xlsx,
+                file_name=st.session_state.shared_xlsx_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
